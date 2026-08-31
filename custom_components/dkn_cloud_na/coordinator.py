@@ -60,7 +60,7 @@ class DknCoordinator(DataUpdateCoordinator[dict[str, Device]]):
                 _LOGGER.error("Failed to connect installation %s socket: %s", inst_id, err)
 
     async def _async_update_data(self) -> dict[str, Device]:
-        # No polling — return the current push-maintained state.
+        # No polling - return the current push-maintained state.
         return self.devices
 
     @callback

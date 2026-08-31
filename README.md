@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="brands/dkn_cloud_na/logo.png" alt="DKN Cloud NA" width="520">
+  <img src="custom_components/dkn_cloud_na/brand/logo.png" alt="DKN Cloud NA" width="520">
 </p>
 
 <p align="center">
@@ -14,7 +14,7 @@
 
 Control your **Daikin / Airzone "DKN Cloud NA"** air-conditioning units from
 [Home Assistant](https://www.home-assistant.io/). Each unit becomes a full
-climate entity — power, mode, target temperature and fan speed — with live
+climate entity - power, mode, target temperature and fan speed - with live
 status updates.
 
 This integration works with the units managed by the **DKN Cloud NA** mobile
@@ -24,18 +24,18 @@ DKN Cloud NA accounts that other Daikin/Airzone integrations don't support.
 
 ## Features
 
-- 🌡️ **Climate entity per unit** — on/off, HVAC mode (auto, cool, heat, fan, dry),
+- 🌡️ **Climate entity per unit** - on/off, HVAC mode (auto, cool, heat, fan, dry),
   current temperature, target temperature, fan speed, and louvre swing (where the
   unit supports it).
-- 📊 **Diagnostic sensors** — outdoor temperature, Wi-Fi signal, outdoor-unit
+- 📊 **Diagnostic sensors** - outdoor temperature, Wi-Fi signal, outdoor-unit
   current draw and air quality (PM1 / PM2.5 / PM10), shown only when the hardware
   reports them.
-- 🚦 **Status sensors** — connectivity and fault/problem binary sensors per unit.
-- ⚡ **Live updates** — state is pushed in real time; the integration does not
+- 🚦 **Status sensors** - connectivity and fault/problem binary sensors per unit.
+- ⚡ **Live updates** - state is pushed in real time; the integration does not
   poll, so it stays responsive without hammering the service.
-- 🏢 **Multiple homes/zones** — every installation and unit on your account is
+- 🏢 **Multiple homes/zones** - every installation and unit on your account is
   added automatically.
-- 🌎 **°F or °C** — follows each unit's own temperature setting.
+- 🌎 **°F or °C** - follows each unit's own temperature setting.
 
 ## Requirements
 
@@ -87,9 +87,9 @@ assistants.
 
 ## Troubleshooting
 
-- **"Invalid authentication"** — double-check the email/password by signing in
+- **"Invalid authentication"** - double-check the email/password by signing in
   with the DKN Cloud NA app; the integration uses the same credentials.
-- **No units appear** — make sure the units are online in the app first, then
+- **No units appear** - make sure the units are online in the app first, then
   reload the integration from **Settings → Devices & Services**.
 
 ## Changelog

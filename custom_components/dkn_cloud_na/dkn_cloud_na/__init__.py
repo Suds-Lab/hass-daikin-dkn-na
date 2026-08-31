@@ -1,4 +1,4 @@
-"""dkn_cloud_na — async client for the Daikin DKN Cloud NA (dkncloudna.com) API."""
+"""dkn_cloud_na - async client for the Daikin DKN Cloud NA (dkncloudna.com) API."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from .exceptions import (
 from .models import Device, Installation, parse_installations, sanitize_device
 from .socket import DknSocket
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 
 __all__ = [
     "DknCloudNaClient",

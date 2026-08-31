@@ -5,7 +5,7 @@ confirmed live: the handshake returns length-prefixed framing
 ``97:0{...}2:40`` regardless of the requested EIO version. ``python-socketio``
 v5 only speaks EIO4 (fails here with "OPEN packet not returned"), and pinning
 the old v4 client conflicts with Home Assistant's bundled version. So we
-implement just the slice of the protocol the app uses — **polling transport
+implement just the slice of the protocol the app uses - **polling transport
 only**, mirroring ``socket.service.js`` (``transports:['polling']``).
 
 Protocol summary (Engine.IO v3 XHR-polling, string payloads):
@@ -139,6 +139,13 @@ class DknSocket:
         self._ns_connected = asyncio.Event()
         self._poll_task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
+        self._watchdog_task: Optional[asyncio.Task] = None
+        # Liveness bookkeeping for the watchdog (monotonic clock).
+        self._last_rx = 0.0
+        self._ns_down_since: Optional[float] = None
+        # Serialise reconnects so the poll loop and watchdog can't race two
+        # overlapping handshakes onto the same connection.
+        self._reconnect_lock = asyncio.Lock()
 
     # -- public API ---------------------------------------------------------
     @property
@@ -153,10 +160,14 @@ class DknSocket:
             self._session = aiohttp.ClientSession()
         self._closing = False
         await self._handshake()
+        self._last_rx = time.monotonic()
         # Connect to our namespace, then start the background loops.
         await self._send_packet(f"{_EIO_MESSAGE}{_SIO_CONNECT}{self.namespace},")
         self._poll_task = asyncio.create_task(self._poll_loop(), name=f"dkn-poll-{self.installation_id}")
         self._ping_task = asyncio.create_task(self._ping_loop(), name=f"dkn-ping-{self.installation_id}")
+        self._watchdog_task = asyncio.create_task(
+            self._watchdog_loop(), name=f"dkn-watchdog-{self.installation_id}"
+        )
         try:
             await asyncio.wait_for(self._ns_connected.wait(), timeout=connect_timeout)
         except asyncio.TimeoutError as err:
@@ -174,15 +185,16 @@ class DknSocket:
 
     async def disconnect(self) -> None:
         self._closing = True
-        for task in (self._poll_task, self._ping_task):
+        for task in (self._poll_task, self._ping_task, self._watchdog_task):
             if task and not task.done():
                 task.cancel()
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
-        self._poll_task = self._ping_task = None
+        self._poll_task = self._ping_task = self._watchdog_task = None
         self._ns_connected.clear()
+        self._ns_down_since = None
         if self._own_session and self._session and not self._session.closed:
             await self._session.close()
 
@@ -270,12 +282,19 @@ class DknSocket:
                 await asyncio.sleep(self._ping_interval)
                 if self._closing:
                     return
+                # A reconnect may be in flight (sid cleared); skip this beat and
+                # resume keepalive once the poll loop/watchdog restores the sid.
+                if self._sid is None:
+                    continue
                 try:
                     await self._send_packet(_EIO_PING)
                 except _Reconnect:
-                    return  # poll loop owns reconnection
-                except DknConnectionError as err:
-                    _LOGGER.debug("ping failed: %s", err)
+                    # Token refreshed / transport reset mid-ping. The poll loop
+                    # and watchdog own reconnection; keep looping so keepalive
+                    # resumes afterwards instead of dying until a reload.
+                    continue
+                except (DknConnectionError, aiohttp.ClientError, asyncio.TimeoutError) as err:
+                    _LOGGER.debug("ping failed (%s); watchdog will recover if needed", err)
         except asyncio.CancelledError:
             raise
 
@@ -286,9 +305,21 @@ class DknSocket:
                 try:
                     text = await self._get()
                     _LOGGER.debug("GET <- %r", text)
+                    self._last_rx = time.monotonic()
                     backoff = 1.0
                     for packet in decode_payload(text):
-                        await self._handle_packet(packet)
+                        # Isolate each packet: a single malformed frame or a
+                        # raising device-data callback must not kill the poll
+                        # loop (which would freeze all entities until a reload).
+                        try:
+                            await self._handle_packet(packet)
+                        except _Reconnect:
+                            raise  # deliberate reconnect signal, not an error
+                        except Exception:  # noqa: BLE001
+                            _LOGGER.exception(
+                                "installation %s: error handling packet %r",
+                                self.installation_id, packet,
+                            )
                 except _Reconnect:
                     if self._closing:
                         return
@@ -300,29 +331,106 @@ class DknSocket:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 60)
                     await self._reconnect()
+                except Exception as err:  # noqa: BLE001
+                    # Last-resort guard: never let an unexpected error terminate
+                    # the loop. Back off and try to re-establish the connection.
+                    if self._closing:
+                        return
+                    _LOGGER.exception(
+                        "installation %s: unexpected poll error (%s); reconnecting in %ss",
+                        self.installation_id, err, backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+                    await self._reconnect()
         except asyncio.CancelledError:
             raise
 
-    async def _reconnect(self) -> None:
+    def _mark_ns_up(self) -> None:
+        self._ns_connected.set()
+        self._ns_down_since = None
+
+    def _mark_ns_down(self) -> None:
         self._ns_connected.clear()
-        self._sid = None
+        if self._ns_down_since is None and not self._closing:
+            self._ns_down_since = time.monotonic()
+
+    async def _reconnect(self) -> None:
+        # One reconnect at a time: the poll loop and the watchdog can both ask
+        # for a reconnect concurrently, and overlapping handshakes would tangle
+        # the sid. Whoever gets the lock second re-checks and usually no-ops.
+        async with self._reconnect_lock:
+            if self._closing:
+                return
+            self._mark_ns_down()
+            self._sid = None
+            try:
+                await self._handshake()
+                await self._send_packet(f"{_EIO_MESSAGE}{_SIO_CONNECT}{self.namespace},")
+                # Treat a successful re-handshake as fresh activity, and restart
+                # the namespace-down grace window, so the watchdog gives this
+                # attempt's CONNECT reply a full window to arrive before firing
+                # again (avoids a re-handshake storm if the namespace is slow).
+                now = time.monotonic()
+                self._last_rx = now
+                if self._ns_down_since is not None:
+                    self._ns_down_since = now
+            except (_Reconnect, DknConnectionError) as err:
+                _LOGGER.debug("reconnect attempt failed: %s", err)
+
+    async def _watchdog_loop(self) -> None:
+        """Force a reconnect when the connection goes silent or loses its namespace.
+
+        Two independent failure modes are covered:
+          * **transport silent** - no inbound packet (not even a pong to our
+            pings) for a full ping window; the server or network dropped us.
+          * **namespace down** - the transport is alive (pongs still arrive) but
+            our installation namespace has been disconnected too long, so no
+            ``device-data`` will ever come. Without this, entities freeze at
+            their last value until the user reloads the integration.
+        """
         try:
-            await self._handshake()
-            await self._send_packet(f"{_EIO_MESSAGE}{_SIO_CONNECT}{self.namespace},")
-        except (_Reconnect, DknConnectionError) as err:
-            _LOGGER.debug("reconnect attempt failed: %s", err)
+            while not self._closing:
+                await asyncio.sleep(self._ping_interval)
+                if self._closing:
+                    return
+                if self._reconnect_lock.locked():
+                    continue  # a reconnect is already running
+                now = time.monotonic()
+                window = self._ping_interval + self._ping_timeout
+                silent = now - self._last_rx
+                transport_silent = self._last_rx > 0 and silent > window
+                ns_down = (
+                    self._ns_down_since is not None
+                    and now - self._ns_down_since > window
+                )
+                if transport_silent or ns_down:
+                    reason = "transport silent" if transport_silent else "namespace down"
+                    stale = silent if transport_silent else now - self._ns_down_since
+                    _LOGGER.warning(
+                        "installation %s watchdog: %s for %.0fs; forcing reconnect",
+                        self.installation_id, reason, stale,
+                    )
+                    await self._reconnect()
+        except asyncio.CancelledError:
+            raise
 
     # -- packet handling ----------------------------------------------------
     async def _handle_packet(self, packet: str) -> None:
         if not packet:
             return
+        # Any well-formed inbound packet is proof of life for the watchdog.
+        self._last_rx = time.monotonic()
         etype = packet[0]
         if etype == _EIO_PING:          # server-initiated ping -> pong
             await self._send_packet(_EIO_PONG)
         elif etype == _EIO_PONG:        # reply to our ping
             return
         elif etype == _EIO_CLOSE:
-            _LOGGER.debug("server closed engine.io")
+            # Server tore down the engine.io session; the current sid is dead.
+            # Reconnect instead of polling a closed session until it errors out.
+            _LOGGER.debug("server closed engine.io; reconnecting")
+            raise _Reconnect()
         elif etype == _EIO_MESSAGE:
             await self._handle_message(packet[1:])
 
@@ -334,10 +442,16 @@ class DknSocket:
             return
         if sio_type == _SIO_CONNECT and namespace == self.namespace:
             _LOGGER.info("installation %s namespace connected", self.installation_id)
-            self._ns_connected.set()
+            self._mark_ns_up()
         elif sio_type == _SIO_ERROR:
-            _LOGGER.error("socket namespace error: %s", data)
-            self._ns_connected.clear()
+            # Namespace-level error (transport is still alive, so pings keep
+            # succeeding). Mark it down and let the watchdog re-establish after
+            # a grace period rather than hammering the server in a tight loop.
+            _LOGGER.error(
+                "installation %s namespace error: %s; watchdog will re-establish",
+                self.installation_id, data,
+            )
+            self._mark_ns_down()
         elif sio_type == _SIO_EVENT and isinstance(data, list) and data:
             await self._dispatch_event(data)
 

@@ -7,6 +7,7 @@ JWT bearer auth with a refresh-token retry on 401.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 import aiohttp
@@ -24,6 +25,19 @@ from .exceptions import DknApiError, DknAuthError, DknConnectionError
 from .models import Installation, parse_installations
 
 _LOGGER = logging.getLogger(__name__)
+
+#: The refresh token is passed as a path segment (auth/refreshToken/<token>/dknUsa).
+#: Mask it before any route string is logged or put in an exception message.
+_REFRESH_TOKEN_IN_ROUTE = re.compile(r"(refreshToken/)[^/]+")
+_REDACTED = "<redacted>"
+
+
+def _safe_route(route: str, secret: Optional[str] = None) -> str:
+    """Return ``route`` with the refresh token masked, for logs/exceptions."""
+    masked = _REFRESH_TOKEN_IN_ROUTE.sub(rf"\g<1>{_REDACTED}", route)
+    if secret:
+        masked = masked.replace(secret, _REDACTED)
+    return masked
 
 
 class DknCloudNaClient:
@@ -54,6 +68,7 @@ class DknCloudNaClient:
     async def _request(self, method: str, route: str, *, json: Any = None,
                        _retry: bool = True) -> Any:
         url = self._base + route.lstrip("/")
+        safe_route = _safe_route(route, self.refresh_token_value)
         try:
             async with self._session.request(
                 method, url, json=json, headers=self._headers(), timeout=self._timeout
@@ -67,20 +82,20 @@ class DknCloudNaClient:
 
                 if resp.status == 401 and _retry and self.refresh_token_value:
                     # Session expired -> refresh and replay once (api.service.js).
-                    _LOGGER.debug("401 on %s; refreshing token", route)
+                    _LOGGER.debug("401 on %s; refreshing token", safe_route)
                     await self.refresh()
                     return await self._request(method, route, json=json, _retry=False)
 
                 if resp.status >= 400:
                     error_id = body.get("_id") if isinstance(body, dict) else None
                     raise DknApiError(
-                        f"{method} {route} -> HTTP {resp.status} ({error_id or resp.reason})",
+                        f"{method} {safe_route} -> HTTP {resp.status} ({error_id or resp.reason})",
                         status=resp.status,
                         error_id=error_id,
                     )
                 return body
         except aiohttp.ClientError as err:
-            raise DknConnectionError(f"{method} {route} failed: {err}") from err
+            raise DknConnectionError(f"{method} {safe_route} failed: {err}") from err
 
     # -- auth ---------------------------------------------------------------
     async def login(self, email: str, password: str) -> dict:
